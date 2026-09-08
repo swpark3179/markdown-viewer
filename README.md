@@ -36,6 +36,9 @@ Windows 데스크톱에서 Markdown 문서를 읽기 전용으로 열어 보기 
 
 ```text
 .
+├─ .github/
+│  ├─ workflows/release.yml     # 버전 결정 → 빌드 → main 반영 → Release 생성
+│  └─ scripts/                  # 릴리스 워크플로가 쓰는 보조 스크립트
 ├─ src/                         # React 프론트엔드
 │  ├─ App.tsx                   # 메인 뷰어 UI와 상태 관리
 │  ├─ main.tsx                  # React 진입점
@@ -114,6 +117,38 @@ npx tauri build
 
 - 실행 파일: `src-tauri/target/release/markdown-viewer.exe`
 - NSIS 설치 파일: `src-tauri/target/release/bundle/nsis/마크다운 뷰어_0.1.0_x64-setup.exe`
+
+## 릴리스
+
+GitHub Actions 의 `Release` 워크플로로 설치 파일을 만들어 Release 페이지에 올린다.
+
+실행 방법: 저장소의 `Actions` 탭 > `Release` > `Run workflow` 에서 올릴 버전 단위를 고른다.
+
+| 입력값 | 결과 |
+| --- | --- |
+| `patch` | `1.2.3` → `1.2.4` |
+| `minor` | `1.2.3` → `1.3.0` |
+| `major` | `1.2.3` → `2.0.0` |
+
+워크플로가 하는 일:
+
+1. 마지막 Release 버전을 기준으로 다음 버전을 정한다. 조회에 실패하면 `git` 태그, 소스 설정 파일 순으로 기준을 찾는다. Release 도 태그도 없는 첫 릴리스라면 입력값과 관계없이 `1.0.0` 을 쓴다.
+2. `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` 의 버전을 맞춘다.
+3. `windows-latest` 러너에서 `npx tauri build` 로 설치 파일을 만든다.
+4. 설치 파일이 실제로 생겼고 이름에 이번 버전이 들어갔는지 확인한다. 여기서 실패하면 커밋도 Release 생성도 하지 않는다.
+5. 확인이 끝난 뒤에 버전 변경을 `chore(release): vX.Y.Z` 로 커밋해 `main` 에 푸시한다.
+6. 해당 커밋에 `vX.Y.Z` 태그를 달고 Release 페이지를 만든다. 본문에는 이전 태그 이후의 커밋 이력과 GitHub 이 만든 `What's Changed` 목록이 함께 들어간다.
+
+첨부되는 파일:
+
+| 파일 | 설명 |
+| --- | --- |
+| `markdown-viewer_X.Y.Z_x64-setup.exe` | Windows 설치 파일. 탐색기 오른쪽 클릭 메뉴와 `연결 프로그램` 등록까지 함께 설정된다. |
+| `markdown-viewer_X.Y.Z_x64-portable.exe` | 설치 없이 실행하는 단일 실행 파일. 탐색기 통합은 되지 않는다. |
+
+빌드 산출물의 원래 이름에는 `productName` 인 `마크다운 뷰어` 가 들어가는데, Release 첨부 파일 이름에서 한글이 깨지지 않도록 ASCII 이름으로 바꿔서 올린다.
+
+워크플로는 실행 위치와 관계없이 항상 `main` 브랜치를 체크아웃해서 빌드한다. `main` 에 브랜치 보호 규칙이 걸려 있으면 5번 푸시 단계에서 실패하므로, GitHub Actions 가 푸시할 수 있도록 예외를 열어 두어야 한다.
 
 ## 사용 방법
 

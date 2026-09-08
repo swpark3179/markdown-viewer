@@ -1,0 +1,265 @@
+name: Release
+
+# 수동 실행 전용 릴리스 워크플로.
+#
+#   1. 마지막 GitHub Release 버전을 보고 다음 버전을 정한다.
+#      (조회 실패 시 git 태그 -> 소스 설정 파일 순서로 대체하고,
+#       릴리스가 하나도 없으면 입력값과 관계없이 1.0.0 을 쓴다)
+#   2. package.json / Cargo.toml / tauri.conf.json 등에 버전을 반영한다.
+#   3. Windows 설치 파일(exe)을 빌드하고 산출물을 확인한다.
+#   4. 확인된 뒤에야 버전 변경을 main 에 커밋 & 푸시한다.
+#   5. 커밋 이력이 담긴 Release 페이지를 만들고 exe 를 첨부한다.
+#
+# 빌드 대상은 실행 위치와 무관하게 항상 main 브랜치다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: '올릴 버전 단위 (첫 릴리스는 입력값과 관계없이 1.0.0)'
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+# 릴리스가 겹쳐 돌면 버전이 꼬이므로 한 번에 하나만 실행한다.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 빌드 및 릴리스
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 소스 체크아웃 (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Node.js 준비
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Rust 준비
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 빌드 캐시
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 프론트엔드 의존성 설치
+        run: npm ci
+
+      - name: 다음 버전 결정
+        id: version
+        shell: bash
+        env:
+          BUMP: ${{ inputs.bump }}
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/resolve-version.mjs
+
+      - name: 설정 파일에 버전 반영
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: node .github/scripts/apply-version.mjs
+
+      - name: Windows 설치 파일 빌드
+        run: npx tauri build
+
+      - name: 빌드 산출물 확인
+        id: artifacts
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:VERSION
+
+          # 설치 파일 이름에는 productName("마크다운 뷰어")이 들어가므로 이름을 고정하지 않고 찾는다.
+          $installer = Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $installer) {
+            throw '설치 파일(*-setup.exe)을 찾지 못했습니다. 빌드 로그를 확인해 주세요.'
+          }
+          if ($installer.Name -notlike "*$version*") {
+            throw "설치 파일 이름에 버전 $version 이 없습니다: $($installer.Name)"
+          }
+          if ($installer.Length -le 0) {
+            throw "설치 파일 크기가 0 입니다: $($installer.Name)"
+          }
+
+          # 릴리스 첨부 파일 이름은 한글이 깨지지 않도록 ASCII 로 바꿔서 올린다.
+          $setupName = "markdown-viewer_${version}_x64-setup.exe"
+          New-Item -ItemType Directory -Force -Path 'release-artifacts' | Out-Null
+          Copy-Item $installer.FullName "release-artifacts/$setupName" -Force
+          '설치 파일: {0} -> {1} ({2:N1} MB)' -f $installer.Name, $setupName, ($installer.Length / 1MB) | Write-Host
+          "setup_name=$setupName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          # 설치 없이 쓰는 단일 실행 파일은 덤으로 같이 올린다.
+          # Tauri 가 실행 파일 이름을 productName 으로 바꾸기도 해서 이름을 고정하지 않는다.
+          $candidates = @(Get-ChildItem -Path 'src-tauri/target/release' -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+          $portable = $candidates | Where-Object { $_.BaseName -eq 'markdown-viewer' } | Select-Object -First 1
+          if (-not $portable) { $portable = $candidates | Select-Object -First 1 }
+
+          if ($portable -and $portable.Length -gt 0) {
+            $portableName = "markdown-viewer_${version}_x64-portable.exe"
+            Copy-Item $portable.FullName "release-artifacts/$portableName" -Force
+            '실행 파일: {0} -> {1} ({2:N1} MB)' -f $portable.Name, $portableName, ($portable.Length / 1MB) | Write-Host
+            "portable_name=$portableName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            Write-Host '::warning::단일 실행 파일을 찾지 못해 설치 파일만 첨부합니다.'
+            "portable_name=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: 버전 변경 커밋 및 main 반영
+        id: commit
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add package.json package-lock.json \
+            src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+
+          if git diff --cached --quiet; then
+            echo "버전이 이미 ${VERSION} 이라 새로 커밋할 내용이 없습니다."
+          else
+            git commit -m "chore(release): v${VERSION}"
+          fi
+
+          # 릴리스 도중 main 이 움직였을 수 있으므로 몇 번 재시도한다.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "main 푸시 완료 (시도 ${attempt}회)"
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              echo "::error::main 브랜치 푸시에 실패했습니다. 브랜치 보호 규칙을 확인해 주세요."
+              exit 1
+            fi
+            sleep $((attempt * 4))
+            git pull --rebase origin main || true
+          done
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: 릴리스 노트 작성
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}
+          SETUP_NAME: ${{ steps.artifacts.outputs.setup_name }}
+          PORTABLE_NAME: ${{ steps.artifacts.outputs.portable_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git config i18n.logOutputEncoding utf-8
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            RANGE="${PREVIOUS_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          # 버전만 올린 커밋은 변경 이력에서 뺀다.
+          git log --grep='^chore(release): ' --invert-grep \
+            --pretty=format:'- %s (%h)' "$RANGE" > commits.txt || true
+
+          {
+            echo '## 다운로드'
+            echo
+            echo '| 파일 | 설명 |'
+            echo '| --- | --- |'
+            echo "| \`${SETUP_NAME}\` | Windows 설치 파일입니다. 탐색기 오른쪽 클릭 메뉴와 \`연결 프로그램\` 등록까지 함께 설정됩니다. |"
+            if [ -n "${PORTABLE_NAME:-}" ]; then
+              echo "| \`${PORTABLE_NAME}\` | 설치 없이 실행하는 단일 실행 파일입니다. 탐색기 통합은 되지 않습니다. |"
+            fi
+            echo
+            echo '## 커밋 이력'
+            echo
+            if [ -s commits.txt ]; then
+              cat commits.txt
+              echo
+            else
+              echo '- 이전 릴리스 이후 변경된 커밋이 없습니다.'
+            fi
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo
+              echo "**전체 변경 사항**: https://github.com/${REPO}/compare/${PREVIOUS_TAG}...${TAG}"
+            fi
+          } > release-notes.md
+
+          cat release-notes.md
+
+      - name: Release 페이지 생성
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          SETUP_NAME: ${{ steps.artifacts.outputs.setup_name }}
+          PORTABLE_NAME: ${{ steps.artifacts.outputs.portable_name }}
+        run: |
+          set -euo pipefail
+
+          # generate_release_notes 를 켜면 GitHub 이 만든 "What's Changed" 목록이
+          # 위에서 만든 본문 뒤에 이어 붙는다.
+          node -e '
+            const fs = require("node:fs");
+            process.stdout.write(JSON.stringify({
+              tag_name: process.env.TAG,
+              target_commitish: process.env.SHA,
+              name: `마크다운 뷰어 ${process.env.TAG}`,
+              body: fs.readFileSync("release-notes.md", "utf8"),
+              generate_release_notes: true,
+              draft: false,
+              prerelease: false,
+            }));
+          ' > release-payload.json
+
+          gh api "repos/${REPO}/releases" --method POST --input release-payload.json > release.json
+          node -e 'console.log(JSON.parse(require("node:fs").readFileSync("release.json","utf8")).html_url)'
+
+          assets=("release-artifacts/${SETUP_NAME}")
+          if [ -n "${PORTABLE_NAME:-}" ]; then
+            assets+=("release-artifacts/${PORTABLE_NAME}")
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber --repo "$REPO"
+
+      - name: 요약
+        if: always()
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+          SETUP_NAME: ${{ steps.artifacts.outputs.setup_name }}
+        run: |
+          {
+            echo '## 릴리스 결과'
+            echo
+            echo "- 태그: ${TAG:-(버전 결정 전 실패)}"
+            echo "- 설치 파일: ${SETUP_NAME:-(빌드 전 실패)}"
+            if [ -n "${TAG:-}" ]; then
+              echo "- Release 페이지: https://github.com/${REPO}/releases/tag/${TAG}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
