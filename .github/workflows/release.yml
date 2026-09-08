@@ -11,6 +11,20 @@ name: Release
 #   5. 커밋 이력이 담긴 Release 페이지를 만들고 exe 를 첨부한다.
 #
 # 빌드 대상은 실행 위치와 무관하게 항상 main 브랜치다.
+#
+# [외부 action 을 쓰지 않는 이유]
+# 이 저장소의 Actions 설정은 외부 action 사용을 허용하지 않는다. 그래서
+# `uses:` 가 단 하나라도 있으면 job 이 만들어지기도 전에 워크플로가
+# "시작 실패(startup failure)" 로 끝나 버린다. actions/checkout 하나만
+# 남겨도 마찬가지다. 대신 windows 러너 이미지에 이미 들어 있는
+# git / node / npm / rustup / cargo / gh 만 써서 같은 일을 한다.
+#   - 체크아웃      : git CLI + GITHUB_TOKEN
+#   - Node.js       : 러너 기본 제공 (v22)
+#   - Rust          : 러너 기본 제공 (stable-msvc)
+#   - Rust 빌드 캐시: 없음 (actions/cache 도 외부 action 이라 못 쓴다)
+# Settings -> Actions -> General -> "Allow all actions and reusable
+# workflows" 로 바꾸면 다시 action 을 쓸 수 있다. 아래 "러너 도구 확인"
+# 단계가 이 방식의 전제 조건을 미리 검사한다.
 
 on:
   workflow_dispatch:
@@ -37,28 +51,55 @@ jobs:
   release:
     name: 빌드 및 릴리스
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
+      - name: 러너 도구 확인
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 외부 action 없이 도는 워크플로이므로 러너 기본 도구가 전제 조건이다.
+          # 이미지가 바뀌어 도구가 빠졌다면 빌드 한참 뒤가 아니라 여기서 멈춘다.
+          for tool in git node npm cargo rustc gh; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::러너에 ${tool} 이 없습니다. 외부 action 없이는 빌드할 수 없습니다."
+              exit 1
+            fi
+            printf '%-6s %s\n' "$tool" "$("$tool" --version 2>&1 | head -1)"
+          done
+
+          # @tauri-apps/cli 2.x 는 Node 20 이상을 요구한다.
+          node -e 'const major = Number(process.versions.node.split(".")[0]);
+            if (major < 20) {
+              console.error(`::error::Node 20 이상이 필요합니다 (현재 ${process.version})`);
+              process.exit(1);
+            }'
+
       - name: 소스 체크아웃 (main)
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
 
-      - name: Node.js 준비
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
+          # 토큰은 remote 주소에 박지 않고 헤더로 넘긴다.
+          # (.git/config 나 오류 메시지에 토큰이 남지 않게 하려는 것)
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\r\n')
+          echo "::add-mask::${AUTH}"
 
-      - name: Rust 준비
-        uses: dtolnay/rust-toolchain@stable
+          git init --quiet --initial-branch=main .
+          git config --local core.autocrlf false
+          git config --local core.longpaths true
+          git config --local 'http.https://github.com/.extraheader' "AUTHORIZATION: basic ${AUTH}"
+          git remote add origin "https://github.com/${REPO}.git"
 
-      - name: Rust 빌드 캐시
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
+          # 버전 판단(태그)과 릴리스 노트(커밋 범위)에 전체 이력과 태그가 필요하다.
+          git fetch --quiet --prune --tags origin +refs/heads/main:refs/remotes/origin/main
+          git reset --quiet --hard refs/remotes/origin/main
+
+          echo "체크아웃: main $(git rev-parse --short HEAD) - $(git log -1 --pretty=%s)"
 
       - name: 프론트엔드 의존성 설치
         run: npm ci

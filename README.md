@@ -150,6 +150,21 @@ GitHub Actions 의 `Release` 워크플로로 설치 파일을 만들어 Release 
 
 워크플로는 실행 위치와 관계없이 항상 `main` 브랜치를 체크아웃해서 빌드한다. `main` 에 브랜치 보호 규칙이 걸려 있으면 5번 푸시 단계에서 실패하므로, GitHub Actions 가 푸시할 수 있도록 예외를 열어 두어야 한다.
 
+### 외부 action 을 쓰지 않는 이유
+
+이 저장소의 Actions 설정은 외부 action 사용을 허용하지 않는다. 그래서 워크플로에 `uses:` 가 단 하나라도 있으면 job 이 만들어지기도 전에 실행이 **시작 실패(startup failure)** 로 끝난다. `actions/checkout` 하나만 남겨도 마찬가지다.
+
+그래서 `Release` 워크플로는 action 없이, `windows-latest` 러너 이미지에 이미 들어 있는 도구만 쓴다.
+
+| 원래 쓰던 action | 대신 쓰는 것 |
+| --- | --- |
+| `actions/checkout` | `git` CLI + `GITHUB_TOKEN` (전체 이력과 태그를 함께 받아온다) |
+| `actions/setup-node` | 러너 기본 제공 Node.js (v22) |
+| `dtolnay/rust-toolchain` | 러너 기본 제공 Rust stable (msvc) |
+| `Swatinem/rust-cache` | 없음. Rust 빌드 캐시 없이 매번 새로 빌드한다 (약 5분) |
+
+`Settings > Actions > General > Allow all actions and reusable workflows` 로 바꾸면 다시 action 을 쓸 수 있다. 워크플로 첫 단계인 `러너 도구 확인` 이 이 방식의 전제 조건(`git`, `node`, `npm`, `cargo`, `rustc`, `gh`)을 미리 검사하므로, 러너 이미지가 바뀌어 도구가 빠지면 빌드 중간이 아니라 시작 직후에 멈춘다.
+
 ## 사용 방법
 
 앱 실행 후 상단 메뉴의 `파일 > 열기` 또는 `Ctrl+O`로 Markdown 파일을 선택합니다. 파일을 창 안으로 드래그 앤 드롭해도 열 수 있습니다.
